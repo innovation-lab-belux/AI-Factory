@@ -45,13 +45,19 @@ def load_and_preprocess_unspsc_data(csv_path: str, column_mapping: Dict[str, str
     thinking_log = []
     thinking_log.append(f"Attempting to load UNSPSC data from CSV: {csv_path}")
     try:
-        df = pd.read_csv(csv_path, dtype=str)
-        thinking_log.append(f"Successfully loaded CSV. Shape: {df.shape}")
+        # Try UTF-8 first, then fallback to 'latin1' if UnicodeDecodeError occurs
+        try:
+            df = pd.read_csv(csv_path, dtype=str, encoding='utf-8')
+            thinking_log.append(f"Successfully loaded CSV with UTF-8 encoding. Shape: {df.shape}")
+        except UnicodeDecodeError:
+            thinking_log.append("UTF-8 decoding failed. Trying 'latin1' encoding...")
+            df = pd.read_csv(csv_path, dtype=str, encoding='latin1')
+            thinking_log.append(f"Successfully loaded CSV with 'latin1' encoding. Shape: {df.shape}")
     except FileNotFoundError:
         thinking_log.append(f"Error: UNSPSC CSV file not found at {csv_path}")
         raise FileNotFoundError(f"UNSPSC CSV file not found at {csv_path}")
     except Exception as e:
-        thinking_log.append(f"Error reading UNSPSC CSV: {str(e)}")
+        thinking_log.append(f"Error reading UNSPSC CSV (after trying UTF-8 and latin1): {str(e)}")
         raise e
 
     # These are the internal names the script will use.
@@ -211,6 +217,9 @@ JSON Response (ensure it's a single JSON object with a "results" list):
                     return [result_json]
                 else:
                     current_thinking.append(f"  Error: LLM selected code {selected_code} not in provided {target_level_name} candidates.")
+                    # Fallback: if LLM hallucinates a code not in list, but the name seems plausible,
+                    # try to find the closest match in candidates by name if code is wrong.
+                    # This is an advanced recovery, for now, we'll just error out.
                     return [{"error": f"LLM selected code {selected_code} not in provided {target_level_name} candidates."}]
             else:
                 current_thinking.append(f"  Error: LLM response for {target_level_name} not in expected format: {llm_response_content}")
@@ -222,6 +231,8 @@ JSON Response (ensure it's a single JSON object with a "results" list):
                     if isinstance(res_item, dict) and 'code' in res_item and 'name' in res_item:
                          if any(str(c['code']) == str(res_item['code']) for c in candidates):
                             validated_results.append(res_item)
+                         # else:
+                         #    current_thinking.append(f"  Warning: LLM suggested commodity {res_item['code']} not in filtered candidate list for {target_level_name}.")
                 if validated_results:
                     current_thinking.append(f"  LLM Parsed & Validated Top {len(validated_results)} for {target_level_name}: {validated_results}")
                     return validated_results[:top_n]
@@ -382,16 +393,14 @@ def classify_commodity_node(state: ClassificationState) -> Dict:
     commodities = get_unique_level_codes(commodity_df, 'Commodity Code', 'Commodity Name')
     # Filter out any higher-level codes that might be identical to commodity codes if data is messy
     # (e.g., if Class Code '43211600' also appears as a Commodity Code '43211600')
-    commodities = [c for c in commodities if str(c['code'])[-2:] != "00" or str(c['code']) == str(class_code)] # Keep if it's the exact class code (some classes are also commodities)
+    # Keep if it's the exact class code (some classes are also commodities) or if it's a true commodity (ends not in '00')
+    commodities = [c for c in commodities if str(c['code'])[-2:] != "00" or str(c['code']) == str(class_code)]
     state['current_thinking'].append(f"  Found {len(commodities)} unique Commodities under selected Class (after filtering).")
 
     if not commodities:
-        err_msg = f"No valid Commodities found for Class {class_code}."
-        state['current_thinking'].append(f"  Error: {err_msg}")
         # Fallback: Consider the Class itself as a potential commodity if no sub-commodities exist
-        # This is a common scenario in UNSPSC where a Class is the most granular level.
         class_as_commodity = {"code": selected_class['code'], "name": selected_class['name']}
-        state['current_thinking'].append(f"  Fallback: Using selected Class as the top commodity: {class_as_commodity}")
+        state['current_thinking'].append(f"  No distinct sub-commodities found. Using selected Class as the top commodity: {class_as_commodity}")
         print(f"  [CommodityNode] No sub-commodities found. Using Class as commodity: {class_as_commodity['code']} - {class_as_commodity['name']}")
         return {"top_5_commodities": [class_as_commodity], "error_message": None, "current_thinking": state['current_thinking']}
 
@@ -413,7 +422,8 @@ def classify_commodity_node(state: ClassificationState) -> Dict:
         class_as_commodity = {"code": selected_class['code'], "name": selected_class['name']}
         state['current_thinking'].append(f"  Fallback due to error: Using selected Class as the top commodity: {class_as_commodity}")
         print(f"  [CommodityNode] Error selecting commodities. Using Class as commodity: {class_as_commodity['code']} - {class_as_commodity['name']}")
-        return {"top_5_commodities": [class_as_commodity], "error_message": None, "current_thinking": state['current_thinking']} # Return class as commodity, clear error for this step
+        # Return class as commodity. We don't set error_message here as we've "handled" it with a fallback.
+        return {"top_5_commodities": [class_as_commodity], "error_message": None, "current_thinking": state['current_thinking']} 
 
     state['current_thinking'].append(f"  Selected Top Commodities: {results}")
     print(f"  [CommodityNode] Selected Top {len(results)} Commodities.")
@@ -429,12 +439,11 @@ def final_result_node(state: ClassificationState) -> Dict:
     final_summary_parts.append(f"Item: {item['name']} - {item['description']}")
     print(f"Item: {item['name']} - {item['description']}")
 
-    if state.get("error_message"):
-        err_msg = f"Error during classification: {state['error_message']}"
+    if state.get("error_message"): # This captures errors from earlier critical stages (like data loading, or non-handled LLM errors)
+        err_msg = f"Overall Error during classification: {state['error_message']}"
         final_summary_parts.append(err_msg)
         print(err_msg)
         state['current_thinking'].append(err_msg)
-        # Even with an error, show what was selected if anything
     
     if state.get('selected_segment'):
         seg_info = f"  Selected Segment: {state['selected_segment']['code']} - {state['selected_segment']['name']}"
@@ -446,24 +455,27 @@ def final_result_node(state: ClassificationState) -> Dict:
         cls_info = f"  Selected Class: {state['selected_class']['code']} - {state['selected_class']['name']}"
         final_summary_parts.append(cls_info); print(cls_info)
 
+    output_for_state = None
     if state.get("top_5_commodities"):
         com_header = "\n  Top Commodity Matches:"
         final_summary_parts.append(com_header); print(com_header)
         for comm in state["top_5_commodities"]:
             com_info = f"    - Code: {comm['code']}, Name: {comm['name']}"
             final_summary_parts.append(com_info); print(com_info)
-        # For the graph state, just return the commodities or error
         output_for_state = state["top_5_commodities"]
     else:
-        no_com_msg = "Classification finished, but no commodity codes were determined."
-        if state.get("error_message"): # If there was an earlier error, it's already noted
-             pass
-        elif state.get("selected_class"): # If we got to class but no commodities
-             no_com_msg += f" Stuck at Class: {state['selected_class']['name']}"
+        # This case should ideally be covered if top_5_commodities is None after commodity node
+        # or if an error_message is already set.
+        no_com_msg = "Classification finished, but no commodity codes were determined (and no overriding error)."
+        if state.get("selected_class") and not state.get("error_message"): # If we got to class but no commodities & no other error
+             no_com_msg = f" Stuck at Class: {state['selected_class']['name']}, no specific commodities found."
         final_summary_parts.append(no_com_msg); print(no_com_msg)
-        output_for_state = no_com_msg # Or an error structure
+        # If there was an overall error, that takes precedence for the final_output_summary's error state
+        output_for_state = [{"error": state.get("error_message") or no_com_msg}]
+
 
     state['current_thinking'].extend(final_summary_parts)
+    # Optional: print full thinking log for debugging
     # print("\nFull Thinking Log for this item:")
     # for entry in state['current_thinking']:
     #     print(f"  THINK: {entry}")
@@ -476,54 +488,72 @@ def should_continue(state: ClassificationState) -> str:
     decision_reason = ""
     next_node = "end_process_error" # Default to error end
 
+    # Check for a persistent error_message first. This indicates a problem that prevents continuation.
     if state.get("error_message"):
-        decision_reason = f"Error encountered: {state['error_message']}. Ending process."
+        decision_reason = f"Error encountered: {state['error_message']}. Routing to end_process_error."
         next_node = "end_process_error"
-    else:
+    else: # No persistent error, proceed based on current step's success
         current_step = state.get("current_step")
         if current_step == "start":
             if state.get("unspsc_df") is not None:
                 decision_reason = "Data loaded, proceeding to Segment classification."
                 next_node = "classify_segment_node"
-            else:
-                decision_reason = "Data loading failed in start_node." # Error should be set
+            else: # Should have set error_message if df is None
+                decision_reason = "Data loading failed (unspsc_df is None but no error_message set - unexpected)."
+                state["error_message"] = "Data loading failed in start_node." # Ensure error is set
                 next_node = "end_process_error"
         elif current_step == "classify_segment":
             if state.get("selected_segment"):
                 decision_reason = "Segment selected, proceeding to Family classification."
                 next_node = "classify_family_node"
-            else: # Error should have been set by the node if selection failed
-                decision_reason = "Segment not selected or error in segment node."
+            else:
+                decision_reason = "Segment not selected (should have error_message if failed)."
+                state["error_message"] = state.get("error_message", "Segment selection failed.")
                 next_node = "end_process_error"
         elif current_step == "classify_family":
             if state.get("selected_family"):
                 decision_reason = "Family selected, proceeding to Class classification."
                 next_node = "classify_class_node"
             else:
-                decision_reason = "Family not selected or error in family node."
+                decision_reason = "Family not selected."
+                state["error_message"] = state.get("error_message", "Family selection failed.")
                 next_node = "end_process_error"
         elif current_step == "classify_class":
             if state.get("selected_class"):
                 decision_reason = "Class selected, proceeding to Commodity classification."
                 next_node = "classify_commodity_node"
             else:
-                decision_reason = "Class not selected or error in class node."
+                decision_reason = "Class not selected."
+                state["error_message"] = state.get("error_message", "Class selection failed.")
                 next_node = "end_process_error"
         elif current_step == "classify_commodity":
+            # Commodity node handles its own fallbacks, so if top_5_commodities is set, it's considered a success for flow
             if state.get("top_5_commodities"):
-                decision_reason = "Commodities selected, proceeding to final result."
+                decision_reason = "Commodities determined (or fallback applied), proceeding to final result."
                 next_node = "final_result_node"
-            else: # Error should have been set by the node
-                decision_reason = "Commodities not selected or error in commodity node."
+            else: # This implies an unhandled issue in commodity node if error_message wasn't set there
+                decision_reason = "Commodities not determined after commodity node."
+                state["error_message"] = state.get("error_message", "Commodity determination failed.")
                 next_node = "end_process_error"
-        elif current_step == "finished": # Should not happen via conditional edge but as a safety
+        elif current_step == "finished":
             decision_reason = "Process already finished."
-            return END # Langgraph END
+            # This should ideally not be reached via conditional edges if graph is structured well
+            # For safety, explicitly return END if somehow we re-evaluate 'finished' state.
+            print(f"  [Decision] Current Step: {state.get('current_step')}. -> {decision_reason} -> ENDING")
+            return END 
         else:
             decision_reason = f"Unknown current_step: {current_step} or logic error. Ending."
+            state["error_message"] = state.get("error_message", f"Unknown step: {current_step}")
             next_node = "end_process_error"
 
-    state['current_thinking'].append(f"Decision: {decision_reason} -> Next Node: {next_node if next_node != END else 'END'}")
+    # Update thinking log with the decision
+    if state.get("current_thinking") is not None: # Ensure current_thinking is initialized
+         state['current_thinking'].append(f"Decision: {decision_reason} -> Next Node: {next_node if next_node != END else 'END'}")
+    else:
+        # This case should not happen if start_node initializes current_thinking
+        print("Warning: current_thinking not initialized in state for should_continue.")
+
+
     print(f"  [Decision] Current Step: {state.get('current_step')}, Error: {state.get('error_message') is not None}. -> {decision_reason} -> Next: {next_node}")
     return next_node
 
@@ -544,22 +574,42 @@ workflow.add_node("end_process_error", final_result_node) # Error end, routes to
 workflow.set_entry_point("start_node")
 
 # Conditional edges guide the process through classification levels or to an error summary
-workflow.add_conditional_edges("start_node", should_continue)
-workflow.add_conditional_edges("classify_segment_node", should_continue)
-workflow.add_conditional_edges("classify_family_node", should_continue)
-workflow.add_conditional_edges("classify_class_node", should_continue)
-workflow.add_conditional_edges("classify_commodity_node", should_continue)
+# The 'should_continue' function will determine the next node based on the current state.
+# It routes to the next logical step if successful, or to 'end_process_error' if an error_message is set in the state.
+workflow.add_conditional_edges(
+    "start_node",
+    should_continue,
+    # No explicit map needed here if should_continue returns the node name directly
+)
+workflow.add_conditional_edges(
+    "classify_segment_node",
+    should_continue,
+)
+workflow.add_conditional_edges(
+    "classify_family_node",
+    should_continue,
+)
+workflow.add_conditional_edges(
+    "classify_class_node",
+    should_continue,
+)
+workflow.add_conditional_edges(
+    "classify_commodity_node",
+    should_continue,
+)
+
 
 # Terminal edges
-workflow.add_edge("final_result_node", END) # From successful completion
-workflow.add_edge("end_process_error", END) # From error path
+workflow.add_edge("final_result_node", END) # From successful completion path
+# end_process_error node itself is final_result_node, which then goes to END
+# So, if should_continue routes to "end_process_error", that node (final_result_node) will execute and then graph ends.
 
 # Compile the graph
 # memory = SqliteSaver.from_conn_string(":memory:") # Optional for state persistence/debugging
 app = workflow.compile() # checkpointer=memory
 
 # --- Main Execution Logic ---
-def classify_item_from_excel_row(
+def classify_item_from_file_row( # Renamed from classify_item_from_excel_row
     row_data: Dict[str, Any],
     unspsc_file_path: str,
     unspsc_col_map: Dict[str, str],
@@ -567,7 +617,7 @@ def classify_item_from_excel_row(
     item_desc_col: str
 ) -> List[Dict]:
     """
-    Classifies a single item represented by a dictionary (a row from an Excel file).
+    Classifies a single item represented by a dictionary (a row from an input file).
     """
     item_name = str(row_data.get(item_name_col, ""))
     item_description = str(row_data.get(item_desc_col, ""))
@@ -590,12 +640,24 @@ def classify_item_from_excel_row(
         current_thinking=[]
     )
 
-    final_state = app.invoke(initial_state)
+    final_state_result = app.invoke(initial_state)
+    
+    # final_state_result is the full state. We need final_output_summary from it.
+    final_output_summary = final_state_result.get("final_output_summary")
 
-    if final_state.get("error_message") and not final_state.get("top_5_commodities"): # If error and no fallback commodities
-        return [{"error": final_state["error_message"], "code": None, "name": None}]
-    # If top_5_commodities exists (even with a prior error that was handled with a fallback), return them
-    return final_state.get("top_5_commodities", [{"error": "No commodities classified and no specific error message.", "code": None, "name": None}])
+
+    # Check if the summary itself indicates an error or is a list of commodities
+    if isinstance(final_output_summary, list) and final_output_summary:
+        if "error" in final_output_summary[0] and final_output_summary[0]["error"]: # Error structure
+             return final_output_summary # Return the error structure like [{"error": "message"}]
+        return final_output_summary # Return the list of commodities
+    elif isinstance(final_output_summary, dict) and "error" in final_output_summary : # Single error dict
+        return [final_output_summary]
+    elif final_state_result.get("error_message"): # Fallback to general error message if summary is not as expected
+        return [{"error": final_state_result["error_message"], "code": None, "name": None}]
+    
+    # If final_output_summary is None or unexpected, return a generic error
+    return [{"error": "No commodities classified and no specific error message from final_output_summary.", "code": None, "name": None}]
 
 
 if __name__ == "__main__":
@@ -609,68 +671,85 @@ if __name__ == "__main__":
         print(f"Using OpenAI API Key: ...{OPENAI_API_KEY[-4:]}")
 
     # 2. Provide the path to your UNSPSC codes CSV file
-    #    **** IMPORTANT: UPDATE THIS PATH ****
-    UNSPSC_DATA_FILE_PATH = "3-UNSPSC/UNSPSC.xlsx" # Example, use your actual file path
+    #    **** IMPORTANT: UPDATE THIS PATH IF DIFFERENT ****
+    UNSPSC_DATA_FILE_PATH = "UNSPSC.xlsx" 
 
-    # 3. **** IMPORTANT: UPDATE THIS MAPPING ****
-    #    Map internal script names to YOUR CSV column names.
-    #    The keys (e.g., 'Segment_Code') are what the script expects internally.
-    #    The values (e.g., 'Your Segment Code Column Name') are the actual column headers in your CSV.
+    # 3. **** IMPORTANT: UPDATE THIS MAPPING IF YOUR UNSPSC CSV HAS DIFFERENT HEADERS ****
     UNSPSC_COLUMN_MAPPING = {
-        'Segment_Code': 'Segment',        # Replace with actual column name for Segment codes
-        'Segment_Name': 'Segment Title',  # Replace with actual column name for Segment names/titles
-        'Family_Code': 'Family',          # Replace with actual column name for Family codes
-        'Family_Name': 'Family Title',    # Replace with actual column name for Family names/titles
-        'Class_Code': 'Class',            # Replace with actual column name for Class codes
-        'Class_Name': 'Class Title',      # Replace with actual column name for Class names/titles
-        'Commodity_Code': 'Commodity',    # Replace with actual column name for Commodity codes
-        'Commodity_Name': 'Commodity Title'# Replace with actual column name for Commodity names/titles
+        'Segment_Code': 'Segment',        
+        'Segment_Name': 'Segment Title',  
+        'Family_Code': 'Family',          
+        'Family_Name': 'Family Title',    
+        'Class_Code': 'Class',            
+        'Class_Name': 'Class Title',      
+        'Commodity_Code': 'Commodity',    
+        'Commodity_Name': 'Commodity Title'
     }
     print(f"Using UNSPSC data file: {UNSPSC_DATA_FILE_PATH}")
     print(f"Using UNSPSC column mapping: {UNSPSC_COLUMN_MAPPING}")
 
 
-    # 4. Provide the path to the Excel file containing items to classify
-    #    **** IMPORTANT: UPDATE THIS PATH ****
-    ITEMS_TO_CLASSIFY_EXCEL_PATH = "path/to/your/items_to_classify.xlsx"
+    # 4. Provide the path to the CSV file containing items to classify
+    #    **** THIS IS NOW SET TO THE USER'S PROVIDED TEST FILE ****
+    ITEMS_TO_CLASSIFY_FILE_PATH = "UNSPSC test dataset.xlsx" 
 
-    # 5. Specify the column names in your items Excel for name and description
-    #    **** IMPORTANT: UPDATE THESE IF YOUR COLUMN NAMES ARE DIFFERENT ****
-    ITEM_NAME_COLUMN = "Item Name"
-    ITEM_DESCRIPTION_COLUMN = "Description"
+    # 5. **** IMPORTANT: UPDATE THESE IF YOUR ITEMS CSV HAS DIFFERENT COLUMN NAMES ****
+    #    Specify the column names in your items CSV for name and description
+    ITEM_NAME_COLUMN = "Item Name"        # Example: "Product Title", "Material Name" etc.
+    ITEM_DESCRIPTION_COLUMN = "Description" # Example: "Product Details", "Specification" etc.
 
     # 6. (Optional) Specify the output Excel file path
     OUTPUT_EXCEL_PATH = "classified_items_output.xlsx"
 
     # --- Load items to classify ---
     try:
-        print(f"Loading items to classify from: {ITEMS_TO_CLASSIFY_EXCEL_PATH}")
-        # Check if ITEMS_TO_CLASSIFY_EXCEL_PATH is a placeholder
-        if "path/to/your/items_to_classify.xlsx" in ITEMS_TO_CLASSIFY_EXCEL_PATH:
-            print("\nWARNING: ITEMS_TO_CLASSIFY_EXCEL_PATH is a placeholder.")
-            print("Simulating with a dummy item. Please update the path to your actual items file.")
-            items_df = pd.DataFrame([{
-                ITEM_NAME_COLUMN: "High Performance Laptop",
-                ITEM_DESCRIPTION_COLUMN: "16GB RAM, 512GB SSD, Latest Gen Processor for professional use"
-            },{
-                ITEM_NAME_COLUMN: "Industrial Safety Gloves",
-                ITEM_DESCRIPTION_COLUMN: "Heavy-duty, cut-resistant gloves for construction workers"
-            }])
-        else:
-            items_df = pd.read_excel(ITEMS_TO_CLASSIFY_EXCEL_PATH)
+        print(f"Loading items to classify from: {ITEMS_TO_CLASSIFY_FILE_PATH}")
+        # Check if ITEMS_TO_CLASSIFY_FILE_PATH is a placeholder or default that might need changing
+        if ITEMS_TO_CLASSIFY_FILE_PATH == "UNSPSC test dataset.xlsx - Sheet1.csv": # Check against the new default
+            # Attempt to load directly, user is expected to have this file
+            try:
+                items_df = pd.read_csv(ITEMS_TO_CLASSIFY_FILE_PATH)
+            except FileNotFoundError:
+                 print(f"\nWARNING: Default items file '{ITEMS_TO_CLASSIFY_FILE_PATH}' not found.")
+                 print("Please ensure the file is in the same directory as the script, or update the path.")
+                 print("Simulating with a dummy item for demonstration purposes.")
+                 items_df = pd.DataFrame([{
+                    ITEM_NAME_COLUMN: "High Performance Laptop",
+                    ITEM_DESCRIPTION_COLUMN: "16GB RAM, 512GB SSD, Latest Gen Processor for professional use"
+                },{
+                    ITEM_NAME_COLUMN: "Industrial Safety Gloves",
+                    ITEM_DESCRIPTION_COLUMN: "Heavy-duty, cut-resistant gloves for construction workers"
+                }])
+        else: # If user changed ITEMS_TO_CLASSIFY_FILE_PATH to something else
+            items_df = pd.read_csv(ITEMS_TO_CLASSIFY_FILE_PATH)
+        
         print(f"Loaded {len(items_df)} items to classify.")
-    except FileNotFoundError:
-        print(f"Error: Items to classify Excel file not found at '{ITEMS_TO_CLASSIFY_EXCEL_PATH}'. Please check the path.")
+        # Inform user about assumed column names for items file
+        print(f"Attempting to use '{ITEM_NAME_COLUMN}' for item names and '{ITEM_DESCRIPTION_COLUMN}' for item descriptions from your items file.")
+        print("If these are incorrect, please update ITEM_NAME_COLUMN and ITEM_DESCRIPTION_COLUMN variables in the script.")
+
+    except FileNotFoundError: # Catch specifically for the case where user provided a path that's not found
+        print(f"Error: Items to classify CSV file not found at '{ITEMS_TO_CLASSIFY_FILE_PATH}'. Please check the path.")
         exit(1)
     except Exception as e:
-        print(f"Error reading items Excel file: {e}")
+        print(f"Error reading items CSV file: {e}")
         exit(1)
 
     results_list = []
     for index, row in items_df.iterrows():
         print(f"\n>>>> Processing item {index + 1} / {len(items_df)}: {row.get(ITEM_NAME_COLUMN, 'N/A')}")
         row_dict = row.to_dict()
-        top_commodities = classify_item_from_excel_row(
+        
+        # Ensure the required columns exist in the row_dict from the items CSV
+        if ITEM_NAME_COLUMN not in row_dict or ITEM_DESCRIPTION_COLUMN not in row_dict:
+            print(f"  Warning: Skipping row {index + 1} due to missing '{ITEM_NAME_COLUMN}' or '{ITEM_DESCRIPTION_COLUMN}'. Check your CSV and column name settings.")
+            output_row = row_dict.copy()
+            output_row['UNSPSC_Match_1_Code'] = 'ERROR'
+            output_row['UNSPSC_Match_1_Name'] = f'Missing required input columns ({ITEM_NAME_COLUMN} or {ITEM_DESCRIPTION_COLUMN})'
+            results_list.append(output_row)
+            continue
+
+        top_commodities = classify_item_from_file_row( # Use the renamed function
             row_dict,
             UNSPSC_DATA_FILE_PATH,
             UNSPSC_COLUMN_MAPPING,
@@ -679,17 +758,21 @@ if __name__ == "__main__":
         )
         
         output_row = row_dict.copy()
-        if top_commodities and not ("error" in top_commodities[0] and top_commodities[0]["error"]):
+        # top_commodities is expected to be a list of dicts, or a list containing one error dict
+        if top_commodities and isinstance(top_commodities, list) and top_commodities[0] and not ("error" in top_commodities[0] and top_commodities[0]["error"]):
              for i, comm in enumerate(top_commodities[:5]): # Ensure only top 5 are written
                 output_row[f'UNSPSC_Match_{i+1}_Code'] = comm.get('code')
                 output_row[f'UNSPSC_Match_{i+1}_Name'] = comm.get('name')
         else: # Handle error or no classification
-            output_row['UNSPSC_Match_1_Code'] = top_commodities[0].get('code', 'ERROR') if top_commodities else 'N/A'
-            output_row['UNSPSC_Match_1_Name'] = top_commodities[0].get('error', 'Classification Failed') if top_commodities else 'N/A'
+            error_message = "Classification Failed"
+            if top_commodities and isinstance(top_commodities, list) and top_commodities[0] and "error" in top_commodities[0]:
+                error_message = top_commodities[0]["error"]
+
+            output_row['UNSPSC_Match_1_Code'] = 'ERROR'
+            output_row['UNSPSC_Match_1_Name'] = error_message
             for i in range(1, 5): # Clear other match columns if error
                  output_row[f'UNSPSC_Match_{i+1}_Code'] = ''
                  output_row[f'UNSPSC_Match_{i+1}_Name'] = ''
-
 
         results_list.append(output_row)
         print("-" * 50)
