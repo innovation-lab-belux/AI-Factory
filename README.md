@@ -187,10 +187,3 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 ## 📜 License
 
 This project is licensed under the [MIT License](LICENSE).
-
----
-
-## 📬 Contact
-
-Innovation Lab BELUX – [innovation-lab-belux@company.com](mailto:innovation-lab-belux@company.com)  
-Feel free to reach out for questions, feature requests, or collaboration!
